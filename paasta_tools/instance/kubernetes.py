@@ -65,7 +65,7 @@ INSTANCE_TYPES_K8S = {
 }
 INSTANCE_TYPES = INSTANCE_TYPES_K8S.union(INSTANCE_TYPES_CR)
 
-INSTANCE_TYPES_WITH_SET_STATE = {"flink", "flinkeks"}
+INSTANCE_TYPES_WITH_SET_STATE = {"flink", "flinkeks", "vitesscluster"}
 INSTANCE_TYPE_CR_ID = dict(
     flink=flink_tools.cr_id,
     flinkeks=flink_tools.cr_id,
@@ -75,6 +75,10 @@ INSTANCE_TYPE_CR_ID = dict(
     nrtsearchservice=nrtsearchservice_tools.cr_id,
     nrtsearchserviceeks=nrtsearchservice_tools.cr_id,
     monkrelaycluster=monkrelaycluster_tools.cr_id,
+)
+
+INSTANCE_TYPE_DESIRED_STATE_SETTER = dict(
+    vitesscluster=vitesscluster_tools.set_cr_desired_state,
 )
 
 
@@ -127,7 +131,10 @@ def set_cr_desired_state(
     desired_state: str,
 ) -> None:
     try:
-        kubernetes_tools.set_cr_desired_state(
+        desired_state_fn = INSTANCE_TYPE_DESIRED_STATE_SETTER.get(
+            instance_type, kubernetes_tools.set_cr_desired_state
+        )
+        desired_state_fn(
             kube_client=kube_client,
             cr_id=cr_id(service, instance, instance_type),
             desired_state=desired_state,

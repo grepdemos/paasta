@@ -1,6 +1,8 @@
 import json
 import logging
 import sys
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import Dict
 from typing import List
@@ -12,9 +14,11 @@ from typing import Union
 import service_configuration_lib
 from kubernetes.client import ApiClient
 
+from paasta_tools.kubernetes_tools import KubeClient
 from paasta_tools.kubernetes_tools import KubernetesDeploymentConfig
 from paasta_tools.kubernetes_tools import KubernetesDeploymentConfigDict
 from paasta_tools.kubernetes_tools import limit_size_with_hash
+from paasta_tools.kubernetes_tools import sanitise_kubernetes_name
 from paasta_tools.kubernetes_tools import sanitised_cr_name
 from paasta_tools.long_running_service_tools import load_service_namespace_config
 from paasta_tools.utils import BranchDictV2
@@ -640,6 +644,61 @@ def get_keyspaces_config(
     return config
 
 
+def update_annotations(target: dict, desired_state: str, current_time: str) -> None:
+    annotations = target.setdefault("annotations", {})
+    annotations["yelp.com/desired_state"] = desired_state
+    annotations["paasta.yelp.com/desired_state"] = desired_state
+    annotations["paasta.yelp.com/desired_state_updated_at"] = current_time
+
+
+def get_current_time() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def set_cr_annotations(
+    cr: dict, component: str, desired_state: str, current_time: str
+) -> None:
+    if component.startswith("vtgate"):
+        cr.setdefault("spec", {}).setdefault("cells", [])
+        for cell in cr["spec"]["cells"]:
+            names = ["vtgate", f"vtgate.{cell.get('name')}"]
+            if component in [sanitise_kubernetes_name(s) for s in names]:
+                update_annotations(cell["gateway"], desired_state, current_time)
+    elif component == "vtadmin":
+        vtadmin = cr.setdefault("spec", {}).setdefault("vtadmin", {})
+        update_annotations(vtadmin, desired_state, current_time)
+    elif component == "vtctld":
+        vitess_dashboard = cr.setdefault("spec", {}).setdefault("vitessDashboard", {})
+        update_annotations(vitess_dashboard, desired_state, current_time)
+    elif component.startswith("vtorc"):
+        cr.setdefault("spec", {}).setdefault("keyspaces", [])
+        for ks in cr["spec"]["keyspaces"]:
+            names = ["vtorc", f"vtorc.{ks.get('name')}"]
+            if component in [sanitise_kubernetes_name(s) for s in names]:
+                vtorc = ks.setdefault("vitessOrchestrator", {})
+                update_annotations(vtorc, desired_state, current_time)
+    elif component.startswith("vttablet"):
+        cr.setdefault("spec", {}).setdefault("keyspaces", [])
+        for ks in cr["spec"]["keyspaces"]:
+            names = ["vttablet", f"vttablet.{ks.get('name')}"]
+            if component in [sanitise_kubernetes_name(s) for s in names]:
+                update_annotations(ks, desired_state, current_time)
+    else:
+        raise RuntimeError(f"Unsupported component {repr(component)}")
+
+
+def set_cr_desired_state(
+    kube_client: KubeClient,
+    cr_id: Mapping[str, str],
+    desired_state: str,
+) -> None:
+    component = cr_id["name"].split(".", 1)[1]
+    cr_id = cr_id_without_suffix(cr_id)
+    cr = kube_client.custom.get_namespaced_custom_object(**cr_id)
+    set_cr_annotations(cr, component, desired_state, get_current_time())
+    kube_client.custom.replace_namespaced_custom_object(**cr_id, body=cr)
+
+
 class VitessDeploymentConfigDict(KubernetesDeploymentConfigDict, total=False):
     images: Dict[str, str]
     cells: List[CellConfigDict]
@@ -902,8 +961,9 @@ def load_vitess_instance_config(
     general_config = service_configuration_lib.read_service_configuration(
         service, soa_dir=soa_dir
     )
+    instance_without_suffix = instance.split(".", 1)[0]
     instance_config = load_service_instance_config(
-        service, instance, "vitesscluster", cluster, soa_dir=soa_dir
+        service, instance_without_suffix, "vitesscluster", cluster, soa_dir=soa_dir
     )
     general_config = deep_merge_dictionaries(
         overrides=instance_config, defaults=general_config
@@ -946,6 +1006,13 @@ def load_vitess_service_instance_configs(
         service, instance, cluster, soa_dir=soa_dir
     ).get_vitess_config()
     return vitess_service_instance_configs
+
+
+def cr_id_without_suffix(cr_id: Mapping[str, str]) -> Mapping[str, str]:
+    instance_without_suffix, component = cr_id["name"].split(".", 1)
+    cr_id_without_suffix = dict(cr_id).copy()
+    cr_id_without_suffix["name"] = instance_without_suffix
+    return cr_id_without_suffix
 
 
 # TODO: read this from CRD in service configs

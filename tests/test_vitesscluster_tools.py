@@ -5,6 +5,8 @@ from kubernetes.client import V1ObjectMeta
 from paasta_tools.utils import SystemPaastaConfig
 from paasta_tools.vitesscluster_tools import load_vitess_instance_config
 from paasta_tools.vitesscluster_tools import load_vitess_service_instance_configs
+from paasta_tools.vitesscluster_tools import set_cr_annotations
+from paasta_tools.vitesscluster_tools import set_cr_desired_state
 from paasta_tools.vitesscluster_tools import VitessDeploymentConfig
 
 
@@ -676,6 +678,303 @@ def mock_vitess_deployment_config():
         return_value=V1ObjectMeta(labels={}),
     ):
         yield
+
+
+@mock.patch(
+    "paasta_tools.vitesscluster_tools.get_current_time",
+    autospec=True,
+)
+def test_update_cr_desired_state(
+    mock_get_current_time,
+):
+    cr = {"spec": {"cells": [{"name": "fake_cell1", "gateway": {}}]}}
+    mock_get_current_time.return_value = "2024-09-09T19:40:24.680957+00:00"
+    kube_client = mock.MagicMock()
+    kube_client.custom.get_namespaced_custom_object.return_value = cr
+
+    set_cr_desired_state(
+        kube_client=kube_client,
+        cr_id={"name": "fake_cr.vtgate"},
+        desired_state="start",
+    )
+    body = kube_client.custom.replace_namespaced_custom_object.call_args[1]["body"]
+    assert body == {
+        "spec": {
+            "cells": [
+                {
+                    "name": "fake_cell1",
+                    "gateway": {
+                        "annotations": {
+                            "yelp.com/desired_state": "start",
+                            "paasta.yelp.com/desired_state": "start",
+                            "paasta.yelp.com/desired_state_updated_at": mock_get_current_time.return_value,
+                        },
+                    },
+                },
+            ],
+        },
+    }
+
+
+def test_set_cr_annotations():
+    desired_state = "start"
+    current_time = "2024-09-09T19:40:24.680957+00:00"
+
+    test_table = [
+        {
+            "restarted_component": "vtgate",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {
+                            "name": "fake_cell1",
+                            "gateway": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                        {
+                            "name": "fake_cell2",
+                            "gateway": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {"name": "tablet1"},
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vtgate.fake--cell1",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {
+                            "name": "fake_cell1",
+                            "gateway": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                        {
+                            "name": "fake_cell2",
+                            "gateway": {},
+                        },
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {"name": "tablet1"},
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vtadmin",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {
+                        "annotations": {
+                            "yelp.com/desired_state": desired_state,
+                            "paasta.yelp.com/desired_state": desired_state,
+                            "paasta.yelp.com/desired_state_updated_at": current_time,
+                        },
+                    },
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {"name": "tablet1"},
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vtctld",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {
+                        "annotations": {
+                            "yelp.com/desired_state": desired_state,
+                            "paasta.yelp.com/desired_state": desired_state,
+                            "paasta.yelp.com/desired_state_updated_at": current_time,
+                        },
+                    },
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {"name": "tablet1"},
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vtorc",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {
+                            "name": "tablet1",
+                            "vitessOrchestrator": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                        {
+                            "name": "tablet2",
+                            "vitessOrchestrator": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vtorc.tablet1",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {
+                            "name": "tablet1",
+                            "vitessOrchestrator": {
+                                "annotations": {
+                                    "yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state": desired_state,
+                                    "paasta.yelp.com/desired_state_updated_at": current_time,
+                                },
+                            },
+                        },
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vttablet",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {
+                            "name": "tablet1",
+                            "annotations": {
+                                "yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state_updated_at": current_time,
+                            },
+                        },
+                        {
+                            "name": "tablet2",
+                            "annotations": {
+                                "yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state_updated_at": current_time,
+                            },
+                        },
+                    ],
+                },
+            },
+        },
+        {
+            "restarted_component": "vttablet.tablet1",
+            "expected": {
+                "spec": {
+                    "cells": [
+                        {"name": "fake_cell1", "gateway": {}},
+                        {"name": "fake_cell2", "gateway": {}},
+                    ],
+                    "vtadmin": {},
+                    "vitessDashboard": {},
+                    "vitessShard": {},
+                    "keyspaces": [
+                        {
+                            "name": "tablet1",
+                            "annotations": {
+                                "yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state": desired_state,
+                                "paasta.yelp.com/desired_state_updated_at": current_time,
+                            },
+                        },
+                        {"name": "tablet2"},
+                    ],
+                },
+            },
+        },
+    ]
+
+    for tt in test_table:
+        cr = {
+            "spec": {
+                "cells": [
+                    {"name": "fake_cell1", "gateway": {}},
+                    {"name": "fake_cell2", "gateway": {}},
+                ],
+                "vtadmin": {},
+                "vitessDashboard": {},
+                "vitessShard": {},
+                "keyspaces": [
+                    {"name": "tablet1"},
+                    {"name": "tablet2"},
+                ],
+            },
+        }
+        set_cr_annotations(cr, tt["restarted_component"], desired_state, current_time)
+        assert cr == tt["expected"], f"Failed for {tt['restarted_component']}"
 
 
 @mock.patch(

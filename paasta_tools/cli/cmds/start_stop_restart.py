@@ -37,6 +37,7 @@ from paasta_tools.kubernetes_tools import KubernetesDeploymentConfig
 from paasta_tools.utils import DEFAULT_SOA_DIR
 from paasta_tools.utils import load_system_paasta_config
 from paasta_tools.utils import PaastaColors
+from paasta_tools.vitesscluster_tools import VitessDeploymentConfig
 
 
 def add_subparser(subparsers):
@@ -231,6 +232,7 @@ def paasta_start_or_stop(args, desired_state):
     invalid_deploy_groups = []
     kubernetes_message_printed = False
     affected_flinks = []
+    affected_vitess_instances = []
 
     if args.clusters is None or args.instances is None:
         if confirm_to_continue(pargs.items(), desired_state) is False:
@@ -250,6 +252,10 @@ def paasta_start_or_stop(args, desired_state):
                 )
                 if isinstance(service_config, FlinkDeploymentConfig):
                     affected_flinks.append(service_config)
+                    continue
+
+                if isinstance(service_config, VitessDeploymentConfig):
+                    affected_vitess_instances.append(service_config)
                     continue
 
                 try:
@@ -320,6 +326,42 @@ def paasta_start_or_stop(args, desired_state):
                 return exc.status
 
             return_val = 0
+
+    if affected_vitess_instances:
+        if desired_state == "stop":
+            print(PaastaColors.red("'stop' is not supported for Vitess instances."))
+            return 1
+
+        system_paasta_config = load_system_paasta_config()
+        for service_config in affected_vitess_instances:
+            cluster = service_config.cluster
+            service = service_config.service
+            instance = service_config.instance
+
+            for arg_instance in args.instances.split(","):
+                if arg_instance != instance:
+                    continue
+
+                client = get_paasta_oapi_client(
+                    cluster=get_paasta_oapi_api_clustername(
+                        cluster=cluster, is_eks=True
+                    ),
+                    system_paasta_config=system_paasta_config,
+                )
+                if not client:
+                    exit(1)
+
+                try:
+                    client.service.instance_set_state(
+                        service=service,
+                        instance=instance,
+                        desired_state=desired_state,
+                    )
+                except client.api_error as exc:
+                    print(exc.reason)
+                    return exc.status
+
+                return_val = 0
 
     if invalid_deploy_groups:
         print(f"No deploy tags found for {', '.join(invalid_deploy_groups)}.")

@@ -11,10 +11,19 @@ from typing import Union
 
 import service_configuration_lib
 from kubernetes.client import ApiClient
+from kubernetes.client import V1ObjectMeta
+from kubernetes.client import V1OwnerReference
+from kubernetes.client import V2beta2CrossVersionObjectReference
+from kubernetes.client import V2beta2HorizontalPodAutoscaler
+from kubernetes.client import V2beta2HorizontalPodAutoscalerSpec
+from kubernetes.client.rest import ApiException
 
+from paasta_tools.kubernetes_tools import get_cr
+from paasta_tools.kubernetes_tools import KubeClient
 from paasta_tools.kubernetes_tools import KubernetesDeploymentConfig
 from paasta_tools.kubernetes_tools import KubernetesDeploymentConfigDict
 from paasta_tools.kubernetes_tools import limit_size_with_hash
+from paasta_tools.kubernetes_tools import paasta_prefixed
 from paasta_tools.kubernetes_tools import sanitised_cr_name
 from paasta_tools.long_running_service_tools import load_service_namespace_config
 from paasta_tools.utils import BranchDictV2
@@ -106,6 +115,14 @@ VTTABLET_EXTRA_FLAGS = {
     "disable_active_reparents": "true",
 }
 
+SCALABLEVTGATE_CRD = {
+    "group": "yelp.com",
+    "version": "v1alpha1",
+    "api_version": "yelp.com/v1alpha1",
+    "plural": "scalablevtgates",
+    "kind": "ScalableVtgate",
+}
+
 
 class KVEnvVar(TypedDict, total=False):
     name: str
@@ -125,6 +142,8 @@ class RequestsDict(TypedDict, total=False):
 
 class ResourceConfigDict(TypedDict, total=False):
     replicas: int
+    min_instances: Optional[int]
+    max_instances: Optional[int]
     requests: Dict[str, RequestsDict]
     limits: Dict[str, RequestsDict]
 
@@ -138,6 +157,8 @@ class GatewayConfigDict(TypedDict, total=False):
     extraVolumes: List[Dict[str, Any]]
     lifecycle: Dict[str, Dict[str, Dict[str, List[str]]]]
     replicas: int
+    min_instances: int
+    max_instances: int
     resources: Dict[str, Any]
     annotations: Mapping[str, Any]
 
@@ -166,6 +187,8 @@ class VtAdminConfigDict(TypedDict, total=False):
     extraFlags: Dict[str, str]
     extraLabels: Dict[str, str]
     replicas: int
+    min_instances: Optional[int]
+    max_instances: Optional[int]
     readOnly: bool
     apiResources: Dict[str, Any]
     webResources: Dict[str, Any]
@@ -244,7 +267,6 @@ def get_cell_config(
     """
     get vtgate config
     """
-    replicas = vtgate_resources.get("replicas")
     requests = vtgate_resources.get(
         "requests", RequestsDict(cpu="100m", memory="256Mi")
     )
@@ -312,7 +334,9 @@ def get_cell_config(
                 },
             ],
             extraLabels=labels,
-            replicas=replicas,
+            replicas=vtgate_resources.get("replicas"),
+            min_instances=vtgate_resources.get("min_instances"),
+            max_instances=vtgate_resources.get("max_instances"),
             resources={
                 "requests": requests,
                 "limits": requests,
@@ -375,6 +399,7 @@ def get_vt_admin_config(
     get vtadmin config
     """
     replicas = vtadmin_resources.get("replicas")
+
     requests = vtadmin_resources.get(
         "requests", RequestsDict(cpu="100m", memory="256Mi")
     )
@@ -858,7 +883,271 @@ class VitessDeploymentConfig(KubernetesDeploymentConfig):
     def get_update_strategy(self) -> Dict[str, str]:
         return {"type": "Immediate"}
 
-    def get_vitess_config(self) -> VitessDeploymentConfigDict:
+    def is_vtgate_autoscaling_enabled(self, cell_config) -> bool:
+        max_instances = self.get_max_instances()
+        return max_instances is not None
+
+    def get_desired_scalablevtgate_cr(
+        self,
+        kube_client: KubeClient,
+        name: str,
+        owner_uid: str,
+        pod_selector: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        return {
+            "apiVersion": SCALABLEVTGATE_CRD["api_version"],
+            "kind": SCALABLEVTGATE_CRD["kind"],
+            "metadata": {
+                "name": name,
+                "namespace": self.get_namespace(),
+                "labels": {
+                    paasta_prefixed("service"): self.service,
+                    paasta_prefixed("instance"): self.instance,
+                    paasta_prefixed("pool"): self.get_pool(),
+                    paasta_prefixed("managed"): "true",
+                },
+                "ownerReferences": [
+                    {
+                        "apiVersion": "planetscale.com/v2",
+                        "kind": "VitessCluster",
+                        "uid": owner_uid,
+                        "name": sanitised_cr_name(self.service, self.instance),
+                        "controller": True,
+                        "blockOwnerDeletion": True,
+                    }
+                ],
+            },
+            "spec": {
+                "selector": ",".join([f"{k}={v}" for k, v in pod_selector.items()]),
+            },
+        }
+
+    def get_autoscaling_target(self, name: str) -> V2beta2CrossVersionObjectReference:
+        return V2beta2CrossVersionObjectReference(
+            api_version=SCALABLEVTGATE_CRD["api_version"],
+            kind=SCALABLEVTGATE_CRD["kind"],
+            name=name,
+        )
+
+    def get_desired_hpa_spec(
+        self,
+        name: str,
+        cluster: str,
+        kube_client: KubeClient,
+        namespace: str,
+        owner_uid: str,
+    ) -> Optional[V2beta2HorizontalPodAutoscaler]:
+        # Returns None if an HPA should not be attached based on the config,
+        # or the config is invalid.
+
+        if self.get_desired_state() == "stop":
+            return None
+
+        if not self.is_autoscaling_enabled():
+            return None
+
+        autoscaling_params = self.get_autoscaling_params()
+        if autoscaling_params["metrics_providers"][0]["decision_policy"] == "bespoke":
+            return None
+
+        min_replicas = self.get_min_instances()
+        max_replicas = self.get_max_instances()
+        if min_replicas == 0 or max_replicas == 0:
+            log.error(
+                f"Invalid value for min or max_instances on {name}: {min_replicas}, {max_replicas}"
+            )
+            return None
+
+        metrics = []
+        for provider in autoscaling_params["metrics_providers"]:
+            spec = self.get_autoscaling_provider_spec(name, namespace, provider)
+            if spec is not None:
+                metrics.append(spec)
+        scaling_policy = self.get_autoscaling_scaling_policy(
+            max_replicas,
+            autoscaling_params,
+        )
+
+        labels = {
+            paasta_prefixed("service"): self.service,
+            paasta_prefixed("instance"): self.instance,
+            paasta_prefixed("pool"): self.get_pool(),
+            paasta_prefixed("managed"): "true",
+        }
+
+        hpa = V2beta2HorizontalPodAutoscaler(
+            kind="HorizontalPodAutoscaler",
+            metadata=V1ObjectMeta(
+                name=name,
+                namespace=namespace,
+                annotations=dict(),
+                labels=labels,
+                owner_references=[
+                    V1OwnerReference(
+                        api_version="planetscale.com/v2",
+                        kind="VitessCluster",
+                        name=sanitised_cr_name(self.service, self.instance),
+                        uid=owner_uid,
+                        controller=True,
+                        block_owner_deletion=True,
+                    ),
+                ],
+            ),
+            spec=V2beta2HorizontalPodAutoscalerSpec(
+                behavior=scaling_policy,
+                max_replicas=max_replicas,
+                min_replicas=min_replicas,
+                metrics=metrics,
+                scale_target_ref=self.get_autoscaling_target(name),
+            ),
+        )
+
+        return hpa
+
+    def get_min_instances(self) -> Optional[int]:
+        vtgate_resources = self.config_dict.get("vtgate_resources")
+        return vtgate_resources.get("min_instances", 1)
+
+    def get_max_instances(self) -> Optional[int]:
+        vtgate_resources = self.config_dict.get("vtgate_resources")
+        return vtgate_resources.get("max_instances")
+
+    def reconcile_vtgate_hpa(
+        self,
+        kube_client: KubeClient,
+        owner_uid: str,
+        cell_config: CellConfigDict,
+    ):
+        name = self.get_vtgate_hpa_name(cell_config["name"])
+        should_exist = self.is_vtgate_autoscaling_enabled(cell_config)
+
+        exists = (
+            len(
+                kube_client.autoscaling.list_namespaced_horizontal_pod_autoscaler(
+                    field_selector=f"metadata.name={name}",
+                    namespace=self.get_namespace(),
+                ).items
+            )
+            > 0
+        )
+
+        if should_exist:
+            hpa = self.get_desired_hpa_spec(
+                name=name,
+                cluster=self.get_cluster(),
+                kube_client=kube_client,
+                namespace=self.get_namespace(),
+                owner_uid=owner_uid,
+            )
+            if not hpa:
+                return
+
+            if exists:
+                kube_client.autoscaling.replace_namespaced_horizontal_pod_autoscaler(
+                    name=name,
+                    namespace=self.get_namespace(),
+                    body=hpa,
+                )
+            else:
+                kube_client.autoscaling.create_namespaced_horizontal_pod_autoscaler(
+                    namespace=self.get_namespace(),
+                    body=hpa,
+                )
+        elif exists:
+            kube_client.autoscaling.delete_namespaced_horizontal_pod_autoscaler(
+                name=name,
+                namespace=self.get_namespace(),
+            )
+            return
+
+    def get_vtgate_hpa_name(self, cell_name: str) -> str:
+        return f"{sanitised_cr_name(self.service, self.instance)}-cell-{cell_name}"
+
+    def reconcile_scalablevtgate_cr(
+        self,
+        kube_client: KubeClient,
+        owner_uid: str,
+        cell_config: CellConfigDict,
+    ):
+        should_exist = self.is_vtgate_autoscaling_enabled(cell_config)
+        name = self.get_vtgate_hpa_name(cell_config["name"])
+        scalablevtgate_cr = self.get_desired_scalablevtgate_cr(
+            kube_client=kube_client,
+            name=name,
+            owner_uid=owner_uid,
+            pod_selector={
+                "planetscale.com/component": "vtgate",
+                "planetscale.com/cell": cell_config["name"],
+                "planetscale.com/cluster": sanitised_cr_name(
+                    self.service, self.instance
+                ),
+            },
+        )
+
+        cr = None
+        try:
+            cr = kube_client.custom.get_namespaced_custom_object(
+                group=SCALABLEVTGATE_CRD["group"],
+                version=SCALABLEVTGATE_CRD["version"],
+                namespace=self.get_namespace(),
+                plural=SCALABLEVTGATE_CRD["plural"],
+                name=name,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise e
+        exists = cr is not None
+
+        if should_exist:
+            if exists:
+                scalablevtgate_cr["metadata"]["resourceVersion"] = cr["metadata"][
+                    "resourceVersion"
+                ]
+                kube_client.custom.replace_namespaced_custom_object(
+                    name=name,
+                    group=SCALABLEVTGATE_CRD["group"],
+                    version=SCALABLEVTGATE_CRD["version"],
+                    namespace=self.get_namespace(),
+                    plural=SCALABLEVTGATE_CRD["plural"],
+                    body=scalablevtgate_cr,
+                )
+            else:
+                kube_client.custom.create_namespaced_custom_object(
+                    group=SCALABLEVTGATE_CRD["group"],
+                    version=SCALABLEVTGATE_CRD["version"],
+                    namespace=self.get_namespace(),
+                    plural=SCALABLEVTGATE_CRD["plural"],
+                    body=scalablevtgate_cr,
+                )
+        elif exists:
+            kube_client.custom.delete_namespaced_custom_object(
+                name=name,
+                group=SCALABLEVTGATE_CRD["group"],
+                version=SCALABLEVTGATE_CRD["version"],
+                namespace=self.get_namespace(),
+                plural=SCALABLEVTGATE_CRD["plural"],
+            )
+
+    def update_related_api_objects(self, kube_client: KubeClient):
+        vitesscluster_cr = get_cr(kube_client, cr_id(self.service, self.instance))
+        if not vitesscluster_cr:
+            # Nothing to do, HPAs are deleted when the VitessCluster is deleted via the owner reference
+            return
+
+        vitesscluster_uid = vitesscluster_cr["metadata"]["uid"]
+        for cell_config in self.get_cells():
+            self.reconcile_vtgate_hpa(
+                kube_client,
+                owner_uid=vitesscluster_uid,
+                cell_config=cell_config,
+            )
+            self.reconcile_scalablevtgate_cr(
+                kube_client,
+                owner_uid=vitesscluster_uid,
+                cell_config=cell_config,
+            )
+
+    def get_vitess_config(self, kube_client: KubeClient) -> VitessDeploymentConfigDict:
         vitess_config = VitessDeploymentConfigDict(
             namespace=self.get_namespace(),
             images=self.get_images(),
@@ -869,6 +1158,35 @@ class VitessDeploymentConfig(KubernetesDeploymentConfig):
             keyspaces=self.get_keyspaces(),
             updateStrategy=self.get_update_strategy(),
         )
+
+        for cell in vitess_config["cells"]:
+            if not self.is_vtgate_autoscaling_enabled(cell):
+                continue
+
+            name = self.get_vtgate_hpa_name(cell["name"])
+            scalablevtgate_cr = None
+            try:
+                scalablevtgate_cr = kube_client.custom.get_namespaced_custom_object(
+                    group=SCALABLEVTGATE_CRD["group"],
+                    version=SCALABLEVTGATE_CRD["version"],
+                    namespace=self.get_namespace(),
+                    plural=SCALABLEVTGATE_CRD["plural"],
+                    name=name,
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    raise e
+                else:
+                    log.error(f"{SCALABLEVTGATE_CRD['kind']} {name} not found")
+
+            if not scalablevtgate_cr:
+                log.error(f"{SCALABLEVTGATE_CRD['kind']} {name} not found")
+                continue
+
+            autoscaled_replicas = scalablevtgate_cr["spec"].get("replicas")
+            if autoscaled_replicas is not None:
+                cell["gateway"]["replicas"] = autoscaled_replicas
+
         return vitess_config
 
     def validate(
@@ -940,12 +1258,25 @@ def load_vitess_service_instance_configs(
     service: str,
     instance: str,
     cluster: str,
+    kube_client: KubeClient,
     soa_dir: str = DEFAULT_SOA_DIR,
 ) -> VitessDeploymentConfigDict:
     vitess_service_instance_configs = load_vitess_instance_config(
         service, instance, cluster, soa_dir=soa_dir
-    ).get_vitess_config()
+    ).get_vitess_config(kube_client=kube_client)
     return vitess_service_instance_configs
+
+
+def update_related_api_objects(
+    service: str,
+    instance: str,
+    cluster: str,
+    kube_client: KubeClient,
+    soa_dir: str = DEFAULT_SOA_DIR,
+) -> None:
+    load_vitess_instance_config(
+        service, instance, cluster, soa_dir=soa_dir
+    ).update_related_api_objects(kube_client)
 
 
 # TODO: read this from CRD in service configs
